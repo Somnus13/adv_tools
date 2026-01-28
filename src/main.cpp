@@ -101,6 +101,70 @@ int bri = 0;
 int brightness[5] = {50, 100, 150, 200, 250};
 // ========================================================
 
+//  ====================Recorder============================
+// 录音缓冲区大小
+static constexpr const size_t record_buffer_size = 1024;
+// 采样率 16khz
+static constexpr const size_t sample_rate = 16000;
+// 位深度 16bit
+static constexpr const uint8_t bit_depth = 16;
+// 单声道
+static constexpr const uint8_t channels = 1;
+
+// 变量
+static int16_t *rec_data; // 录音缓冲区
+static volatile bool isRecording = false; // 录音状态
+static size_t totalSamples = 0; // 总样本数
+File wavFile; // WAV 文件
+static uint32_t w = 240; //屏幕宽度
+
+// wav文件头
+struct WavHeader {
+  char riff[4] = {'R', 'I', 'F', 'F'};
+  uint32_t fileSize;
+  char wave[4] = {'W', 'A', 'V', 'E'};
+  char fmt[4] = {'f', 'm', 't', ' '};
+  uint32_t fmtSize = 16;
+  uint16_t format = 1; // PCM
+  uint16_t channels;
+  uint32_t sampleRate;
+  uint32_t byteRate;
+  uint16_t blockAlign;
+  uint16_t bitsPerSample;
+  char data[4] = {'d', 'a', 't', 'a'};
+  uint32_t dataSize;
+};
+
+// 写入wav文件头
+void writeWavHeader(File &file, int32_t pcmBytes) {
+  WavHeader header;
+  header.fileSize = pcmBytes + 36;
+  header.channels = channels;
+  header.sampleRate = sample_rate;
+  header.byteRate = sample_rate * channels * bit_depth / 8;
+  header.blockAlign = channels * bit_depth / 8;
+  header.bitsPerSample = bit_depth;
+  header.dataSize = pcmBytes;
+
+  file.seek(0);
+  file.write((const uint8_t*)&header, sizeof(WavHeader));
+}
+// ========================================================
+
+// ====================SD============================
+// SD
+#define SD_PAGE_SIZE 6  // 每页显示的文件数量（用于翻页）
+#define SD_MAX_FILES 100  // 文件列表数组的最大容量
+bool isSDReady = false;
+String sdRootPath = "/";
+String sdCurrentPath = "/";
+int sdCurrentIndex = 0;
+// 当前目录下的文件列表（可以存储多个文件，用于翻页）
+String sdFileNames[SD_MAX_FILES];
+String sdFilePaths[SD_MAX_FILES];
+int sdFileCount = 0;
+// ==================================================
+
 //  ====================函数声明============================
 void drawMenu();
 void drawWifi();
@@ -116,6 +180,8 @@ void handleWifiChange();
 void handleTerminalChange();
 void handleWiFiScanChange();
 void handlePlayerChange();
+void handleRecorderChange();
+void handleSdChange();
 
 void connectWifi(int index);
 void scanWiFi();
@@ -124,7 +190,50 @@ void initPlayer();
 void listFiles(fs::FS &fs, const char* path, uint8_t levels);
 void audio_eof_mp3(const char *info);
 bool hasExtension(const char* filename, const char* ext);
+void initRecorder();
+void drawWaveform();
+void listSdFiles(const char* path);
 
+
+// 彻底释放 I2S 资源，防止切换到 WiFi 或 Terminal 时崩溃
+void releaseResources() {
+  // 停止音频播放
+  if (isPlaying) {
+    audio.stopSong();
+    isPlaying = false;
+  }
+  
+  // 停止录音
+  if (isRecording) {
+    isRecording = false;
+    if (wavFile) {
+      wavFile.close();
+    }
+    M5Cardputer.Mic.end();
+  }
+  
+  // 关闭扬声器
+  M5Cardputer.Speaker.end();
+  
+  // 等待资源释放
+  delay(100);
+  
+  // 关闭 WiFi 以省电并释放无线电资源
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+  }
+  
+  Serial.println("System: Resources Released");
+}
+
+// 获取当前系统内存状态字符串
+String getMemoryStatus() {
+    uint32_t freeRAM = ESP.getFreeHeap();
+    uint32_t freePSRAM = ESP.getFreePsram();
+    // 转换为 KB
+    return "RAM: " + String(freeRAM / 1024) + "KB | PSRAM: " + String(freePSRAM / 1024) + "KB";
+}
 
 
 void setup(){
@@ -137,6 +246,13 @@ void setup(){
   M5Cardputer.Display.setBrightness(brightness[bri]);
   M5Cardputer.Display.setTextColor(TFT_WHITE);
   sprite.createSprite(240,135);
+
+  SPI.begin(SD_SCK, SD_MISO, SD_MOSI);
+  if (!SD.begin(SD_CS)) {
+    Serial.println(F("ERROR: SD Mount Failed!"));
+    while (1);
+  }
+  Serial.println("SD Ready!!");
   
   delay(100);
   drawMenu();
@@ -153,6 +269,7 @@ void loop() {
         audio.stopSong(); // 停止播放而不是暂停
         isPlaying = false;
       }
+      releaseResources(); // 核心：切换前清理一切
       currentState = STATE_MENU;
       drawMenu();
     }
@@ -205,9 +322,16 @@ void loop() {
     break;
   case STATE_RECORD:
     // TODO: 实现录音功能
+    if (M5Cardputer.Keyboard.isChange()) {
+      handleRecorderChange();
+    }
+    drawWaveform();
     break;
   case STATE_SD:
     // TODO: 实现 SD 卡管理功能
+    if (M5Cardputer.Keyboard.isChange()) {
+      handleSdChange();
+    }
     break;
   case STATE_TEST:
     // TODO: 实现测试功能
@@ -236,6 +360,8 @@ void handleMenuChange(){
     drawMenu();
   } 
   if (M5Cardputer.Keyboard.isKeyPressed(KEY_ENTER)) {
+    // 进入新功能前，也可以先清理一次确保环境纯净
+    // releaseResources();
     switch (selectItem)
     {   
     case 0:
@@ -251,16 +377,59 @@ void handleMenuChange(){
       drawWiFiScan();
       break;
     case 3:
+      // 如果之前是录音器状态，需要先关闭麦克风并重新初始化扬声器
+      if (currentState == STATE_RECORD) {
+        M5Cardputer.Mic.end();
+        delay(50); // 等待麦克风完全关闭
+        // 释放录音缓冲区
+        if (rec_data) {
+          heap_caps_free(rec_data);
+          rec_data = nullptr;
+        }
+      }
       currentState = STATE_PLAYER;
       drawPlayer();
       initPlayer();
       break;
     case 4:
+      // 如果之前是播放器状态，需要先停止并释放 I2S 资源
+      if (currentState == STATE_PLAYER || isPlaying) {
+        audio.stopSong();
+        isPlaying = false;
+        delay(100); // 等待 I2S 资源释放
+      }
       currentState = STATE_RECORD;
       drawRecorder();
+      initRecorder();
       break;
     case 5:
+      // 清理之前的 I2S 资源（如果从播放器或录音器状态切换过来）
+      if (currentState == STATE_PLAYER) {
+        audio.stopSong();
+        isPlaying = false;
+        delay(50); // 等待 I2S 资源释放
+      }
+      if (currentState == STATE_RECORD) {
+        if (isRecording) {
+          isRecording = false;
+          if (wavFile) {
+            wavFile.close();
+          }
+        }
+        M5Cardputer.Mic.end();
+        delay(50); // 等待麦克风关闭
+      }
+      
       currentState = STATE_SD;
+      // 初始化 SD 卡并加载文件列表
+      if (!SD.begin(SD_CS)) {
+        Serial.println(F("ERROR: SD Mount Failed!"));
+        M5Cardputer.Display.fillScreen(TFT_BLACK);
+        M5Cardputer.Display.setTextColor(TFT_RED);
+        M5Cardputer.Display.drawString("SD Mount Failed!", 10, 60);
+        break;
+      }
+      listSdFiles("/"); // 从根目录开始
       drawSd();
       break;
     case 6:
@@ -312,6 +481,8 @@ void drawMenu(){
   M5Cardputer.Display.setTextColor(TFT_WHITE);
   M5Cardputer.Display.drawString("Menu", 10,6);
   M5Cardputer.Display.drawFastHLine(0,31,240,TFT_DARKGREEN);
+  M5Cardputer.Display.setFont(&fonts::efontCN_12);
+  M5Cardputer.Display.drawString(getMemoryStatus(), 80, 10);
   
   M5Cardputer.Display.endWrite();
 }
@@ -654,18 +825,18 @@ void drawPlayer(){
   static unsigned long lastEqUpdate = 0;
   if (millis() - lastEqUpdate > 100) { // 每 100ms 更新一次均衡器
     for (int i = 0; i < 10; i++) {
-        if (isPlaying) {
-            eqHeights[i] = random(5, 30); // 播放时跳动
-        } else {
-            // 修复：使用三元运算符替代 max 函数，避免头文件依赖
-            eqHeights[i] = (eqHeights[i] - 2 > 2) ? (eqHeights[i] - 2) : 2; // 暂停时缓缓落下
-        }
+      if (isPlaying) {
+        eqHeights[i] = random(5, 30); // 播放时跳动
+      } else {
+        // 修复：使用三元运算符替代 max 函数，避免头文件依赖
+        eqHeights[i] = (eqHeights[i] - 2 > 2) ? (eqHeights[i] - 2) : 2; // 暂停时缓缓落下
+      }
     }
     lastEqUpdate = millis();
   }
   // 绘制均衡器
   for (int i = 0; i < 10; i++) {
-      sprite.fillRect(eqBaseX + i * 16, 90 - eqHeights[i], 12, eqHeights[i], TFT_GREEN);
+    sprite.fillRect(eqBaseX + i * 16, 90 - eqHeights[i], 12, eqHeights[i], TFT_GREEN);
   }
   // seq  00:00  vol
   sprite.setFont(&fonts::efontCN_16);
@@ -692,7 +863,7 @@ void drawPlayer(){
 
   // vol 进度条：20x4，滑块：4x6
   // 绘制背景条
-  sprite.fillRoundRect(170, 100, 20, 4, 2, TFT_GREEN);
+  sprite.fillRect(170, 100, 20, 4, TFT_GREEN);
   // 计算滑块位置：volume 范围 2-10，映射到 0-20 的进度条
   // 修复：先乘后除，避免整数除法精度丢失
   int percent = (volume - 2) * 20 / 8; // (volume-2) 范围 0-8，映射到 0-20
@@ -802,11 +973,7 @@ void initPlayer(){
   
   Serial.println("Initializing player...");
   M5Cardputer.Speaker.begin();
-  SPI.begin(SD_SCK, SD_MISO, SD_MOSI);
-  if (!SD.begin(SD_CS)) {
-      Serial.println(F("ERROR: SD Mount Failed!"));
-      return;
-  }
+  
 
   // 如果缓存列表文件不存在。则创建一个空文件
   if (!SD.exists(CACHE_LIST_PATH)) { 
@@ -962,27 +1129,370 @@ void listFiles(fs::FS &fs, const char *dirname, uint8_t levels) {
   fileCache.close();
 }
 
+void initRecorder(){
+  //TODO: 检查 sd 卡是否挂载
+  
+  // 确保播放器已停止并释放 I2S 资源
+  if (isPlaying) {
+    audio.stopSong();
+    isPlaying = false;
+  }
+  
+  // 等待 I2S 资源完全释放
+  delay(200);
+  
+  // 如果之前已经分配了录音缓冲区，先释放
+  if (rec_data) {
+    heap_caps_free(rec_data);
+    rec_data = nullptr;
+  }
+  
+  // 停止录音（如果正在录音）
+  if (isRecording) {
+    isRecording = false;
+    if (wavFile) {
+      wavFile.close();
+    }
+  }
+  
+  if (!SD.begin(SD_CS)) {
+      M5Cardputer.Display.drawString("SD Failed to Mount", 10, 6);
+      Serial.println(F("ERROR: SD Mount Failed!"));
+      return;
+  }
+  
+  // 确保 recorder 目录存在
+  if (!SD.exists("/recorder")) {
+    SD.mkdir("/recorder");
+    Serial.println("Created /recorder directory");
+  }
+  
+  M5Cardputer.Display.drawString("SD Ready!!", 10, 6);
+
+  // 分配录音缓冲区
+  rec_data = (int16_t*)heap_caps_malloc(record_buffer_size * sizeof(int16_t), MALLOC_CAP_8BIT | MALLOC_CAP_32BIT);
+  if (!rec_data) {
+      M5Cardputer.Display.drawString("Mem Alloc Error", 10, 6);
+      Serial.println("Failed to allocate recording buffer");
+      return;
+  }
+
+  // 关闭扬声器以启用麦克风（确保 I2S 资源已释放）
+  M5Cardputer.Speaker.end();
+  delay(100); // 等待 Speaker 完全关闭
+  M5Cardputer.Mic.begin();
+
+  M5Cardputer.Display.drawString("Press Enter to Rec", 10, 115);
+}
+
 void drawRecorder(){
   Serial.println("drawRecorder");
   M5Cardputer.Display.setFont(&fonts::efontCN_16);
   M5Cardputer.Display.startWrite();
   M5Cardputer.Display.fillRect(0,0,240,135,TFT_BLACK);
-  M5Cardputer.Display.setTextColor(TFT_WHITE);
-  M5Cardputer.Display.drawString("Recorder", 10,6);
-  M5Cardputer.Display.drawFastHLine(0,31,240,TFT_DARKGREEN);
-  M5Cardputer.Display.endWrite();
+}
+
+void handleRecorderChange(){
+  if (M5Cardputer.Keyboard.isKeyPressed(KEY_ENTER)) {
+    // record start/stop
+    isRecording = !isRecording;
+
+    // clear 0 115 to 135
+    M5Cardputer.Display.fillRect(0, 115, 240, 20, TFT_BLACK);
+    if (isRecording) {
+      // record start
+      totalSamples = 0;
+            
+      // 生成文件名 (例如: rec_001.wav)
+      String filename;
+      // 时间戳
+      String timestamp = String(millis());
+      // 确保 recorder 目录存在
+      if (!SD.exists("/recorder")) {
+        SD.mkdir("/recorder");
+        Serial.println("Created /recorder directory");
+      }
+      
+      // 生成唯一文件名
+      int fileNum = 0;
+      do {
+          filename = "/recorder/rec_" + timestamp + "_" + String(fileNum) + ".wav";
+          fileNum++;
+      } while (SD.exists(filename) && fileNum < 1000);
+
+      Serial.printf("Opening file: %s\n", filename.c_str());
+      wavFile = SD.open(filename.c_str(), FILE_WRITE);
+      
+      if (wavFile) {
+          writeWavHeader(wavFile, 0); // 先写入空头部
+          M5Cardputer.Display.drawString("Recording...", 10, 115);
+          M5Cardputer.Display.drawString(timestamp+".wav", 120, 115);
+      } else {
+          isRecording = false;
+          M5Cardputer.Display.drawString("File Open Error", 10, 115);
+      }
+    } else {
+      // record stop
+      uint32_t pcmBytes = totalSamples * sizeof(int16_t);
+      writeWavHeader(wavFile, pcmBytes); // 更新头部信息
+      wavFile.close();
+      
+      M5Cardputer.Display.drawString("Saved!", 10, 115);
+      delay(1000);
+      M5Cardputer.Display.fillRect(0, 115, 240, 20, TFT_BLACK);
+      M5Cardputer.Display.drawString("Press Enter to Rec", 10, 115);
+    }
+  }
+}
+
+// 波形绘制
+void drawWaveform() {
+  // 录音与波形绘制逻辑
+  if (M5Cardputer.Mic.isEnabled()) {
+    // 获取数据用于波形显示 (使用 Mic.record 获取原始数据)
+    // 注意：这里我们复用 rec_data 缓冲区，如果正在录音，这会覆盖即将写入的数据。
+    // 为了简化示例，这里仅演示波形。若需严格同步，建议使用双缓冲。
+    
+    if (M5Cardputer.Mic.record(rec_data, record_buffer_size, sample_rate)) {
+        // 1. 绘制波形
+        static constexpr int shift = 6; // 缩放因子
+        int32_t centerY = M5Cardputer.Display.height() / 2;
+        
+        // 清除上一帧波形 (简单处理：全屏清除或局部清除)
+        // 为性能考虑，这里使用局部清除或直接覆盖绘制
+        M5Cardputer.Display.fillRect(0, centerY - 32, w, 64, BLACK);
+
+        for (int32_t x = 0; x < w; x+=2) { // 步进2以减少绘制压力
+            if (x >= record_buffer_size) break;
+            int32_t y = centerY + (rec_data[x] >> shift);
+            // 限制绘制范围
+            if (y < centerY - 31) y = centerY - 31;
+            if (y > centerY + 31) y = centerY + 31;
+            M5Cardputer.Display.drawFastHLine(x, y, 2, GREEN);
+        }
+
+        // 2. 如果正在录音，将数据写入 SD 卡
+        if (isRecording && wavFile) {
+            size_t written = wavFile.write((const uint8_t*)rec_data, record_buffer_size * sizeof(int16_t));
+            totalSamples += record_buffer_size;
+            
+            // 显示录音时长
+            float sec = (float)totalSamples / sample_rate;
+            M5Cardputer.Display.fillRect(120, 0, 100, 20, TFT_BLACK);
+            M5Cardputer.Display.setCursor(140, 5);
+            M5Cardputer.Display.printf("T: %.1fs", sec);
+        }
+    }
+  }
 }
 
 void drawSd(){
   Serial.println("drawSd");
-  M5Cardputer.Display.setFont(&fonts::efontCN_16);
-  M5Cardputer.Display.startWrite();
+  // clear screen
   M5Cardputer.Display.fillRect(0,0,240,135,TFT_BLACK);
+  M5Cardputer.Display.setFont(&fonts::efontCN_16);
+  M5Cardputer.Display.setTextSize(1);
+
+  M5Cardputer.Display.startWrite();
+  // set cursor 0 0
+  M5Cardputer.Display.setCursor(0,0);
   M5Cardputer.Display.setTextColor(TFT_WHITE);
-  M5Cardputer.Display.drawString("SD", 10,6);
-  M5Cardputer.Display.drawFastHLine(0,31,240,TFT_DARKGREEN);
+  M5Cardputer.Display.println("~ " +sdCurrentPath);
+
+  // 计算显示范围：确保当前选中的文件在可见范围内（上下滚动）
+  int startIndex = 0;
+  
+  if (sdFileCount <= SD_PAGE_SIZE) {
+    // 如果文件总数不超过一页，从 0 开始显示
+    startIndex = 0;
+  } else {
+    // 文件总数超过一页，需要滚动
+    // 让当前项显示在可见范围内
+    if (sdCurrentIndex < SD_PAGE_SIZE) {
+      // 当前索引在前 SD_PAGE_SIZE 个，从 0 开始显示
+      startIndex = 0;
+    } else {
+      // 当前索引 >= SD_PAGE_SIZE，滚动显示，让当前项显示在最后一行
+      startIndex = sdCurrentIndex - SD_PAGE_SIZE + 1;
+      // 确保不超出范围
+      if (startIndex + SD_PAGE_SIZE > sdFileCount) {
+        startIndex = sdFileCount - SD_PAGE_SIZE;
+      }
+    }
+  }
+  
+  int endIndex = startIndex + SD_PAGE_SIZE;
+  if (endIndex > sdFileCount) {
+    endIndex = sdFileCount;
+  }
+  
+  Serial.printf("startIndex: %d, endIndex: %d, sdCurrentIndex: %d, sdFileCount: %d\n", startIndex, endIndex, sdCurrentIndex, sdFileCount);
+  // draw file list
+  int yPos = 16 ; // 从第 20 像素开始绘制文件列表
+  for(int i = startIndex; i < endIndex; i++) {
+    // 当前高亮显示 
+    if (i == sdCurrentIndex) {
+      M5Cardputer.Display.setTextColor(TFT_BLACK);
+      // 绘制选中背景
+      M5Cardputer.Display.fillRect(0, yPos, 240, 16, TFT_GREEN);
+    } else {
+      M5Cardputer.Display.setTextColor(TFT_WHITE);
+    }
+    M5Cardputer.Display.setCursor(5, yPos);
+    M5Cardputer.Display.printf("%s", sdFileNames[i].c_str());
+    yPos += 16  ; // 每行 18 像素高度
+  }
+  M5Cardputer.Display.setTextColor(TFT_WHITE);
+  M5Cardputer.Display.setCursor(0, 115);
+  M5Cardputer.Display.drawString("[;] Up [.] Down [Enter] [Back]", 0, 115);
   M5Cardputer.Display.endWrite();
 }
+
+// 列出指定目录下的文件
+void listSdFiles(const char* path){
+  // 确保路径是绝对路径（以 / 开头）
+  String absPath = String(path);
+  if (!absPath.startsWith("/")) {
+    absPath = "/" + absPath;
+  }
+  Serial.println("listSdFiles: " + absPath);
+  
+  // 重置文件列表
+  sdFileCount = 0;
+  sdCurrentIndex = 0;
+  
+  File dir = SD.open(absPath.c_str());
+  if (!dir) {
+    Serial.println("Failed to open directory");
+    M5Cardputer.Display.fillScreen(TFT_BLACK);
+    M5Cardputer.Display.setTextColor(TFT_RED);
+    M5Cardputer.Display.drawString("Failed to open dir", 10, 60);
+    return;
+  }
+  
+  if (!dir.isDirectory()) {
+    Serial.println("Not a directory");
+    dir.close();
+    return;
+  }
+  
+  File file = dir.openNextFile();
+  int totalScanned = 0; // 调试：统计扫描的文件总数
+  // 标识出文件夹和文件，最多存储 SD_MAX_FILES 个
+  while (file && sdFileCount < SD_MAX_FILES) {
+    totalScanned++;
+    String name = file.name();
+    
+    // 提取文件名（file.name() 可能包含路径，需要提取最后一部分）
+    String baseName = name;
+    int lastSlash = baseName.lastIndexOf('/');
+    if (lastSlash >= 0) {
+      baseName = baseName.substring(lastSlash + 1);
+    }
+    
+    // 跳过隐藏文件和系统目录（检查文件名，不是完整路径）
+    // if (baseName[0] == '.' || baseName == "System Volume Information" || baseName == "LOST.DIR" || baseName == "lost+found") {
+    //   Serial.printf("Skipping: %s\n", baseName.c_str());
+    //   file.close();
+    //   file = dir.openNextFile();
+    //   continue;
+    // }
+    
+    Serial.printf("Adding file %d: %s (baseName: %s)\n", sdFileCount, name.c_str(), baseName.c_str());
+    
+    // 构建完整路径（使用已经规范化的 absPath）
+    String fullPath = absPath;
+    // 确保路径不以 / 结尾（除了根目录）
+    if (fullPath != "/" && fullPath.endsWith("/")) {
+      fullPath = fullPath.substring(0, fullPath.length() - 1);
+    }
+    
+    // 构建子路径
+    String childPath = fullPath;
+    if (fullPath != "/") {
+      childPath += "/";
+    }
+    childPath += baseName;
+    
+    if (file.isDirectory()) {
+      sdFileNames[sdFileCount] = "/" + baseName;
+      sdFilePaths[sdFileCount] = childPath;
+    } else {
+      sdFileNames[sdFileCount] = baseName;
+      sdFilePaths[sdFileCount] = childPath;
+    }
+    sdFileCount++;
+    file.close();
+    file = dir.openNextFile();
+  }
+  
+  // 关闭剩余的文件句柄
+  while (file) {
+    file.close();
+    file = dir.openNextFile();
+  }
+  
+  dir.close();
+  sdCurrentPath = absPath; // 使用规范化的绝对路径
+  sdCurrentIndex = 0;
+  
+  Serial.printf("Scanned %d files, found %d valid files in %s\n", totalScanned, sdFileCount, absPath.c_str());
+}
+
+void handleSdChange(){
+  // 上下键滚动浏览文件列表
+  if (M5Cardputer.Keyboard.isKeyPressed(';')) {
+    // 向上移动
+    if(sdFileCount == 0) {
+      return;
+    }
+    sdCurrentIndex = (sdCurrentIndex - 1 + sdFileCount) % sdFileCount;
+    drawSd();
+  }
+  if (M5Cardputer.Keyboard.isKeyPressed('.')) {
+    // 向下移动
+    if(sdFileCount == 0) {
+      return;
+    }
+    sdCurrentIndex = (sdCurrentIndex + 1) % sdFileCount;
+    drawSd();
+  }
+  // enter to directory
+  if (M5Cardputer.Keyboard.isKeyPressed(KEY_ENTER)) {
+    if (sdFileNames[sdCurrentIndex].startsWith("/")) {
+      // 进入目录
+      sdCurrentPath = sdFilePaths[sdCurrentIndex];
+      // 确保路径是绝对路径（以 / 开头）
+      if (!sdCurrentPath.startsWith("/")) {
+        sdCurrentPath = "/" + sdCurrentPath;
+      }
+      Serial.printf("Entering directory: %s\n", sdCurrentPath.c_str());
+      listSdFiles(sdCurrentPath.c_str());
+      drawSd();
+    } else {
+      // 文件不操作
+    }
+  }
+  // back to parent directory
+  if (M5Cardputer.Keyboard.isKeyPressed(KEY_BACKSPACE)) {
+    // 确保路径是绝对路径
+    if (!sdCurrentPath.startsWith("/")) {
+      sdCurrentPath = "/" + sdCurrentPath;
+    }
+    
+    if (sdCurrentPath != "/") {
+      int lastSlash = sdCurrentPath.lastIndexOf('/');
+      if (lastSlash > 0) {
+        sdCurrentPath = sdCurrentPath.substring(0, lastSlash);
+      } else {
+        sdCurrentPath = "/";
+      }
+    }
+    listSdFiles(sdCurrentPath.c_str());
+    drawSd();
+  }
+}
+
 
 void drawTest(){
   Serial.println("drawTest");
