@@ -34,7 +34,8 @@ enum State {
   STATE_PLAYER,
   STATE_RECORD,
   STATE_SD,
-  STATE_TEST,
+  STATE_ENV,
+  STATE_PIR,
 };
 State currentState = STATE_MENU;
 
@@ -46,10 +47,11 @@ const char* menuItems[] = {
   "4. Player", 
   "5. Recorder", 
   "6. SD", 
-  "7. Test" 
+  "7. ENV Test",
+  "8. PIR Test" 
 };
 int selectItem = 0;
-const int totalItems = 7;
+const int totalItems = 8;
 // ========================================================
 
 
@@ -165,6 +167,21 @@ String sdFilePaths[SD_MAX_FILES];
 int sdFileCount = 0;
 // ==================================================
 
+//  ====================UNIT ENV============================
+
+#include "M5UnitENV.h"
+SHT3X sht3x;
+QMP6988 qmp;
+// ========================================================
+
+//  ====================UNIT PIR============================
+#define PIR_PIN 1
+// 延时参数设置
+const unsigned long delay_time = 5000; //延时关闭时间（ms）
+unsigned long last_trigger_time = 0;
+bool is_triggered = false; 
+// ========================================================
+
 //  ====================函数声明============================
 void drawMenu();
 void drawWifi();
@@ -173,7 +190,8 @@ void drawWiFiScan();
 void drawPlayer();
 void drawRecorder();
 void drawSd();
-void drawTest();
+void drawEnv();
+void drawPir();
 
 void handleMenuChange();
 void handleWifiChange();
@@ -182,6 +200,8 @@ void handleWiFiScanChange();
 void handlePlayerChange();
 void handleRecorderChange();
 void handleSdChange();
+void handleEnvChange();
+void handlePirChange();
 
 void connectWifi(int index);
 void scanWiFi();
@@ -333,8 +353,13 @@ void loop() {
       handleSdChange();
     }
     break;
-  case STATE_TEST:
-    // TODO: 实现测试功能
+  case STATE_ENV:
+    // TODO: 实现环境监测功能
+    handleEnvChange();
+    break;
+  case STATE_PIR:
+    // TODO: 实现PIR检测功能
+    handlePirChange();
     break;
   default:
     break;
@@ -433,8 +458,13 @@ void handleMenuChange(){
       drawSd();
       break;
     case 6:
-      currentState = STATE_TEST;
-      drawTest();
+      currentState = STATE_ENV;
+      
+      drawEnv();
+      break;
+    case 7:
+      currentState = STATE_PIR;
+      drawPir();
       break;
     default:
       break;
@@ -1494,13 +1524,87 @@ void handleSdChange(){
 }
 
 
-void drawTest(){
-  Serial.println("drawTest");
+void drawEnv() {
+
+   auto pin_num_sda = M5.getPin(m5::pin_name_t::port_a_sda);
+  auto pin_num_scl = M5.getPin(m5::pin_name_t::port_a_scl);
+    Serial.printf("I2C SDA Pin: %d, SCL Pin: %d\n", pin_num_sda, pin_num_scl);
+    // Wire.begin(pin_num_sda, pin_num_scl, 400000U); // 使用 M5Cardputer 的 I2C 引脚
+
+  if (!qmp.begin(&Wire, QMP6988_SLAVE_ADDRESS_L, pin_num_sda, pin_num_scl, 400000U)) {
+    Serial.println("Couldn't find QMP6988");
+    while (1) delay(1);
+  }
+
+  if (!sht3x.begin(&Wire, SHT3X_I2C_ADDR, pin_num_sda, pin_num_scl, 400000U)) {
+    Serial.println("Couldn't find SHT3X");
+    while (1) delay(1);
+  }
   M5Cardputer.Display.setFont(&fonts::efontCN_16);
   M5Cardputer.Display.startWrite();
   M5Cardputer.Display.fillRect(0,0,240,135,TFT_BLACK);
   M5Cardputer.Display.setTextColor(TFT_WHITE);
-  M5Cardputer.Display.drawString("Test", 10,6);
+  M5Cardputer.Display.drawString("Env Monitor", 10,6);
   M5Cardputer.Display.drawFastHLine(0,31,240,TFT_DARKGREEN);
   M5Cardputer.Display.endWrite();
+}
+void handleEnvChange() {
+
+  M5Cardputer.Display.fillRect(0, 32, 240, 105, TFT_BLACK);
+  M5Cardputer.Display.setFont(&fonts::efontCN_12);
+
+  
+  if (sht3x.update()) {
+    M5Cardputer.Display.startWrite();
+    M5Cardputer.Display.drawString("-----SHT3X-----", 10, 35);
+    M5Cardputer.Display.drawString("温度：" + String(sht3x.cTemp) + "*C", 10, 35+14);
+    M5Cardputer.Display.drawString("湿度：" + String(sht3x.humidity) + "% rH", 10, 35+28);
+    M5Cardputer.Display.endWrite();
+
+  }
+
+  if (qmp.update()) {
+    M5Cardputer.Display.startWrite();
+    M5Cardputer.Display.drawString("-----QMP6988-----", 10, 35+42);
+    M5Cardputer.Display.drawString("温度：" + String(qmp.cTemp) + "*C", 10, 35+56);
+    M5Cardputer.Display.drawString("压力：" + String(qmp.pressure) + " Pa", 10, 35+70);
+    M5Cardputer.Display.drawString("海拔：" + String(qmp.altitude) + " m", 10, 35+84);
+    M5Cardputer.Display.endWrite();
+  }
+
+  delay(5000);
+}
+
+void drawPir() {
+  M5Cardputer.Display.setFont(&fonts::efontCN_16);
+  M5Cardputer.Display.startWrite();
+  M5Cardputer.Display.fillRect(0,0,240,135,TFT_BLACK);
+  M5Cardputer.Display.setTextColor(TFT_WHITE);
+  M5Cardputer.Display.drawString("PIR Sensor", 10,6);
+  M5Cardputer.Display.drawFastHLine(0,31,240,TFT_DARKGREEN);
+  M5Cardputer.Display.endWrite();
+}
+void handlePirChange() {
+  unsigned long current_time = millis();
+  int pirState = digitalRead(PIR_PIN);
+  M5Cardputer.Display.fillRect(10, 70, 200, 40, TFT_BLACK);
+  M5Cardputer.Display.setCursor(10, 70); 
+
+  if (pirState == HIGH) {
+      last_trigger_time = current_time;
+      is_triggered = true;
+      M5Cardputer.Display.println("检测到人！");
+      // M5.Speaker.tone(1000, 100);
+  } else {
+      if (is_triggered && (current_time - last_trigger_time) > delay_time) {
+          is_triggered = false;
+          M5Cardputer.Display.println("延迟结束，恢复监听...");
+      } else if (is_triggered) {
+          M5Cardputer.Display.println("人离开了，等待延迟...");
+      } else {
+          M5Cardputer.Display.println("监听中...");
+      }
+  }
+
+  delay(100);
 }
